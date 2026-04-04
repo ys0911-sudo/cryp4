@@ -251,24 +251,25 @@ class SignalStore:
         if not csv_path.exists():
             return
         try:
-            df = pd.read_csv(csv_path)
-
-            # Cast string columns to object dtype so pandas accepts string
-            # assignments even when the column was inferred as float64
-            # (happens when all values are empty/NaN on first read).
-            for str_col in ['status', 'exit_time', 'exit_reason']:
-                if str_col in df.columns:
-                    df[str_col] = df[str_col].astype(object)
+            # Read ALL columns as str to avoid float64 dtype inference on
+            # empty columns (exit_time, exit_reason, status start as '').
+            # pandas converts '' → NaN → float64 by default, which then
+            # rejects string assignments even after astype(object) in 2.x.
+            df = pd.read_csv(csv_path, dtype=str)
 
             mask = (
-                (df['symbol'] == pos['symbol']) &
-                (df['signal_time'] == pos['signal_time'])
+                (df['symbol'] == str(pos['symbol'])) &
+                (df['signal_time'] == str(pos['signal_time']))
             )
             if mask.any():
-                for col in ['status', 'exit_price', 'exit_time',
-                            'exit_reason', 'pnl_pct', 'peak_price']:
-                    if col in pos:
-                        df.loc[mask, col] = pos[col]
+                idx = df.index[mask][0]
+                # df.at is the safest scalar setter — no dtype coercion issues
+                df.at[idx, 'status']      = str(pos.get('status', 'closed'))
+                df.at[idx, 'exit_price']  = str(pos.get('exit_price', ''))
+                df.at[idx, 'exit_time']   = str(pos.get('exit_time', ''))
+                df.at[idx, 'exit_reason'] = str(pos.get('exit_reason', ''))
+                df.at[idx, 'pnl_pct']     = str(pos.get('pnl_pct', ''))
+                df.at[idx, 'peak_price']  = str(pos.get('peak_price', ''))
                 df.to_csv(csv_path, index=False)
                 df.to_csv(self.latest_csv, index=False)
         except Exception as e:

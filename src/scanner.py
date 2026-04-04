@@ -342,7 +342,9 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 
         except (Exception,) as e:
             if not reconnect:
+                import traceback
                 print(f"  WebSocket error: {e}. Reconnecting in 5s...")
+                traceback.print_exc()   # full stack trace so we know exact line
                 await asyncio.sleep(5)
             else:
                 print(f"  Reconnecting for coin list update...")
