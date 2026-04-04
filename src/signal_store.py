@@ -5,11 +5,30 @@ Handles:
 - Writing new signals to CSV
 - Deduplication
 - Exit tracking (updates open -> closed)
+  - LIVE exit checking on every WebSocket price tick (no I/O, in-memory)
+  - Fallback REST-based exit checking every 60s as safety net
 - Monthly CSV rotation (so files don't grow forever)
 - Running stats (win rate, PnL) without reading full CSV
+
+ATR-relative exits (1H model):
+  Each signal now stores per-trade absolute exit levels computed from ATR:
+    stop_loss         → entry - sl_atr_mult × ATR    (e.g. entry - 1×ATR)
+    take_profit       → entry + tp_atr_mult × ATR    (e.g. entry + 2×ATR)
+    trailing_activate → entry + sl_atr_mult × ATR    (break-even territory)
+    trailing_distance → ATR × 0.5                    (0.5×ATR trailing width)
+
+  These per-trade prices take priority over global EXIT_CONFIG percentages.
+  EXIT_CONFIG percentages are only used as fallback when ATR was unavailable
+  at signal time (e.g. very new coins with insufficient history).
+
+Exit price accuracy:
+  Exit prices are the EXACT trigger level, not the polled market price:
+    stop_loss     → pos['stop_loss']              exact ATR-computed level
+    take_profit   → pos['take_profit']            exact ATR-computed level
+    trailing_stop → peak - pos['trailing_distance']  exact trail level
+    time_exit     → live market price             (no trigger level exists)
 """
 
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +53,46 @@ class SignalStore:
         self.total_wins = 0
         self.total_pnl = 0.0
 
+        # In-memory open positions for live (zero I/O) exit checking.
+        # key: symbol (UPPERCASE), value: list of position dicts.
+        self._open_positions: dict[str, list[dict]] = {}
+
+        # Tracks positions closed by live checker so check_exits() REST fallback
+        # doesn't re-add them from CSV if the CSV write temporarily failed.
+        # key: "SYMBOL|signal_time"
+        self._recently_closed: set[str] = set()
+
+        self._load_open_positions()
+
+    # ─────────────────────────────────────────────────
+    # Startup
+    # ─────────────────────────────────────────────────
+
+    def _load_open_positions(self) -> None:
+        """Load any open positions from CSV into memory on startup."""
+        csv_path = self.current_csv
+        if not csv_path.exists():
+            return
+        try:
+            df = pd.read_csv(csv_path)
+            open_df = df[df['status'] == 'open']
+            for _, row in open_df.iterrows():
+                sym = row['symbol']
+                pos = row.to_dict()
+                # Ensure peak_price is valid
+                if pd.isna(pos.get('peak_price')):
+                    pos['peak_price'] = pos['entry_price']
+                self._open_positions.setdefault(sym, []).append(pos)
+            total = sum(len(v) for v in self._open_positions.values())
+            if total:
+                print(f"  [store] Resumed {total} open position(s) from CSV")
+        except Exception as e:
+            print(f"  [store] Warning: could not load open positions: {e}")
+
+    # ─────────────────────────────────────────────────
+    # Properties
+    # ─────────────────────────────────────────────────
+
     @property
     def current_csv(self) -> Path:
         """Current month's CSV file. Rotates monthly."""
@@ -42,8 +101,12 @@ class SignalStore:
 
     @property
     def latest_csv(self) -> Path:
-        """Symlink-like pointer to current CSV for easy checking."""
+        """Always-current pointer to the latest CSV."""
         return self.output_dir / "signals_latest.csv"
+
+    # ─────────────────────────────────────────────────
+    # Signal saving
+    # ─────────────────────────────────────────────────
 
     def save_signal(self, signal: dict) -> bool:
         """Save a new signal. Returns True if new (not duplicate)."""
@@ -63,15 +126,166 @@ class SignalStore:
             df_out = df_new
 
         df_out.to_csv(csv_path, index=False)
-
-        # Also write/overwrite latest pointer
         df_out.to_csv(self.latest_csv, index=False)
+
+        # Register in in-memory open positions
+        pos = dict(signal)
+        pos['peak_price'] = pos.get('peak_price') or pos['entry_price']
+        self._open_positions.setdefault(signal['symbol'], []).append(pos)
 
         self.total_signals += 1
         return True
 
+    # ─────────────────────────────────────────────────
+    # LIVE exit checking (called on every WebSocket tick)
+    # ─────────────────────────────────────────────────
+
+    def check_exits_live(self, symbol: str, current_price: float) -> list[dict]:
+        """
+        Check exit conditions for one symbol using a live WebSocket price.
+
+        Called on EVERY price update — must be fast (pure in-memory, no I/O).
+        CSV is only written when a position actually closes.
+
+        Returns a list of closed trade dicts (usually empty or one item).
+        """
+        positions = self._open_positions.get(symbol)
+        if not positions:
+            return []
+
+        now = datetime.now(timezone.utc)
+        closed_trades = []
+        still_open = []
+
+        for pos in positions:
+            entry = float(pos['entry_price'])
+
+            # Track peak price with each live tick
+            old_peak = float(pos.get('peak_price') or entry)
+            peak = max(old_peak, current_price)
+            pos['peak_price'] = peak
+
+            exit_reason = self._check_exit_conditions(
+                entry, current_price, peak, pos, now
+            )
+
+            if exit_reason:
+                # ── KEY FIX: use the exact trigger price, not current_price ──
+                exit_price = self._get_exact_exit_price(
+                    entry, peak, current_price, exit_reason, pos
+                )
+                pnl = round((exit_price / entry - 1) * 100, 3)
+
+                pos.update({
+                    'status':      'closed',
+                    'exit_price':  round(exit_price, 8),
+                    'exit_time':   now.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'exit_reason': exit_reason,
+                    'pnl_pct':     pnl,
+                    'peak_price':  round(peak, 8),
+                })
+
+                # Register as closed BEFORE writing CSV so the REST fallback
+                # check_exits() won't re-add this position if the CSV write fails.
+                closed_key = f"{symbol}|{pos['signal_time']}"
+                self._recently_closed.add(closed_key)
+
+                self._write_closed_position(pos)
+
+                self.total_closed += 1
+                if pnl > 0:
+                    self.total_wins += 1
+                self.total_pnl += pnl
+
+                closed_trades.append({
+                    'symbol': symbol,
+                    'reason': exit_reason,
+                    'entry':  entry,
+                    'exit':   exit_price,
+                    'pnl':    pnl,
+                })
+            else:
+                still_open.append(pos)
+
+        self._open_positions[symbol] = still_open
+        return closed_trades
+
+    def _get_exact_exit_price(
+        self,
+        entry: float,
+        peak: float,
+        current_price: float,
+        exit_reason: str,
+        pos: dict,
+    ) -> float:
+        """
+        Return the precise price at which the exit condition was triggered.
+        Prevents recording a worse price caused by polling lag.
+
+        Per-trade ATR-relative prices (stored in pos dict) take priority.
+        EXIT_CONFIG percentages are fallback only.
+        """
+        cfg = self.exit_config
+        if exit_reason == 'stop_loss':
+            # Use per-trade absolute SL if available (ATR-relative model)
+            if 'stop_loss' in pos and pd.notna(pos.get('stop_loss')):
+                return float(pos['stop_loss'])
+            return entry * (1 - cfg['initial_sl_pct'])
+        elif exit_reason == 'take_profit':
+            # Use per-trade absolute TP if available (ATR-relative model)
+            if 'take_profit' in pos and pd.notna(pos.get('take_profit')):
+                return float(pos['take_profit'])
+            return entry * (1 + cfg['tp_pct'])
+        elif exit_reason == 'trailing_stop':
+            # Trail distance is stored as absolute price offset (e.g. 0.5 × ATR)
+            if 'trailing_distance' in pos and pd.notna(pos.get('trailing_distance')):
+                return peak - float(pos['trailing_distance'])
+            return peak * (1 - cfg['trailing_distance_pct'])
+        else:
+            # time_exit has no specific trigger price — use live market price
+            return current_price
+
+    def _write_closed_position(self, pos: dict) -> None:
+        """Update the CSV row for a newly closed position."""
+        csv_path = self.current_csv
+        if not csv_path.exists():
+            return
+        try:
+            df = pd.read_csv(csv_path)
+
+            # Cast string columns to object dtype so pandas accepts string
+            # assignments even when the column was inferred as float64
+            # (happens when all values are empty/NaN on first read).
+            for str_col in ['status', 'exit_time', 'exit_reason']:
+                if str_col in df.columns:
+                    df[str_col] = df[str_col].astype(object)
+
+            mask = (
+                (df['symbol'] == pos['symbol']) &
+                (df['signal_time'] == pos['signal_time'])
+            )
+            if mask.any():
+                for col in ['status', 'exit_price', 'exit_time',
+                            'exit_reason', 'pnl_pct', 'peak_price']:
+                    if col in pos:
+                        df.loc[mask, col] = pos[col]
+                df.to_csv(csv_path, index=False)
+                df.to_csv(self.latest_csv, index=False)
+        except Exception as e:
+            print(f"  [store] Warning: CSV write failed for {pos.get('symbol')}: {e}")
+
+    # ─────────────────────────────────────────────────
+    # Fallback REST-based exit check (every 60s)
+    # ─────────────────────────────────────────────────
+
     def check_exits(self) -> list[dict]:
-        """Check all open signals for exit conditions. Returns list of closed trades."""
+        """
+        Fallback exit checker using REST price fetch.
+
+        Runs every 60s as a safety net for any positions the live checker
+        may have missed (e.g. scanner restart, coins not in WebSocket stream).
+        Also syncs in-memory state with CSV on restart.
+        """
         csv_path = self.current_csv
         if not csv_path.exists():
             return []
@@ -89,73 +303,84 @@ class SignalStore:
         if len(open_signals) == 0:
             return []
 
-        # Batch fetch all prices in one call
+        # Re-sync in-memory positions with CSV
+        # (catches positions opened before a scanner restart)
+        for _, row in open_signals.iterrows():
+            sym = row['symbol']
+            sig_time = row['signal_time']
+            closed_key = f"{sym}|{sig_time}"
+
+            # Skip positions already closed by live checker even if CSV
+            # hasn't been updated yet (prevents double-exit on CSV write failure)
+            if closed_key in self._recently_closed:
+                continue
+
+            already_tracked = any(
+                p.get('signal_time') == sig_time
+                for p in self._open_positions.get(sym, [])
+            )
+            if not already_tracked:
+                pos = row.to_dict()
+                if pd.isna(pos.get('peak_price')):
+                    pos['peak_price'] = pos['entry_price']
+                self._open_positions.setdefault(sym, []).append(pos)
+
         prices = self._fetch_all_prices()
         if not prices:
             return []
 
-        now = datetime.now(timezone.utc)
-        closed_trades = []
-        changed = False
+        all_closed = []
+        for sym, price in prices.items():
+            if self._open_positions.get(sym):
+                closed = self.check_exits_live(sym, price)
+                all_closed.extend(closed)
 
-        for idx, row in open_signals.iterrows():
-            symbol = row['symbol']
-            entry = row['entry_price']
-            current_price = prices.get(symbol)
-            if current_price is None:
-                continue
+        return all_closed
 
-            peak = max(row.get('peak_price', entry), current_price)
-            signals.at[idx, 'peak_price'] = peak
+    # ─────────────────────────────────────────────────
+    # Exit condition logic (shared by live + REST paths)
+    # ─────────────────────────────────────────────────
 
-            exit_reason = self._check_exit_conditions(entry, current_price, peak, row, now)
+    def _check_exit_conditions(
+        self, entry, price, peak, pos, now
+    ) -> str | None:
+        """Evaluate exit conditions. Returns reason string or None.
 
-            if exit_reason:
-                pnl = (current_price / entry - 1) * 100
-                signals.at[idx, 'status'] = 'closed'
-                signals.at[idx, 'exit_price'] = round(current_price, 6)
-                signals.at[idx, 'exit_time'] = now.strftime('%Y-%m-%d %H:%M:%S UTC')
-                signals.at[idx, 'exit_reason'] = exit_reason
-                signals.at[idx, 'pnl_pct'] = round(pnl, 3)
-                changed = True
-
-                # Update running stats
-                self.total_closed += 1
-                if pnl > 0:
-                    self.total_wins += 1
-                self.total_pnl += pnl
-
-                closed_trades.append({
-                    'symbol': symbol, 'reason': exit_reason,
-                    'entry': entry, 'exit': current_price, 'pnl': pnl
-                })
-
-        if changed:
-            signals.to_csv(csv_path, index=False)
-            signals.to_csv(self.latest_csv, index=False)
-
-        return closed_trades
-
-    def _check_exit_conditions(self, entry, price, peak, row, now) -> str | None:
-        """Evaluate exit conditions. Returns reason string or None."""
+        Per-trade ATR-relative absolute prices (stored in pos dict) take
+        priority over global EXIT_CONFIG percentages. This ensures each trade
+        uses the TP/SL levels that were computed from ATR at signal time,
+        matching the backtest's labeling logic exactly.
+        """
         cfg = self.exit_config
 
-        # 1. Hard stop loss
-        if price <= entry * (1 - cfg['initial_sl_pct']):
+        # 1. Hard stop loss — use per-trade absolute level if available
+        sl_price = (float(pos['stop_loss'])
+                    if 'stop_loss' in pos and pd.notna(pos.get('stop_loss'))
+                    else entry * (1 - cfg['initial_sl_pct']))
+        if price <= sl_price:
             return 'stop_loss'
 
-        # 2. Trailing stop
-        if peak >= entry * (1 + cfg['trailing_activate_pct']):
-            trail_sl = peak * (1 - cfg['trailing_distance_pct'])
+        # 2. Trailing stop — use per-trade absolute activate/distance if available
+        trail_activate = (float(pos['trailing_activate'])
+                          if 'trailing_activate' in pos and pd.notna(pos.get('trailing_activate'))
+                          else entry * (1 + cfg['trailing_activate_pct']))
+        if peak >= trail_activate:
+            trail_distance = (float(pos['trailing_distance'])
+                              if 'trailing_distance' in pos and pd.notna(pos.get('trailing_distance'))
+                              else peak * cfg['trailing_distance_pct'])
+            trail_sl = peak - trail_distance
             if price <= trail_sl:
                 return 'trailing_stop'
 
-        # 3. Take profit
-        if price >= entry * (1 + cfg['tp_pct']):
+        # 3. Take profit — use per-trade absolute level if available
+        tp_price = (float(pos['take_profit'])
+                    if 'take_profit' in pos and pd.notna(pos.get('take_profit'))
+                    else entry * (1 + cfg['tp_pct']))
+        if price >= tp_price:
             return 'take_profit'
 
         # 4. Time exit
-        signal_time = pd.to_datetime(row['signal_time'])
+        signal_time = pd.to_datetime(pos['signal_time'])
         if signal_time.tzinfo is None:
             signal_time = signal_time.replace(tzinfo=timezone.utc)
         mins_held = (now - signal_time).total_seconds() / 60
@@ -165,32 +390,38 @@ class SignalStore:
         return None
 
     def _fetch_all_prices(self) -> dict[str, float]:
-        """Batch fetch all current prices from Binance."""
+        """Batch fetch all current prices from Binance REST."""
         try:
-            resp = requests.get(f"{BINANCE_REST}/api/v3/ticker/price", timeout=10)
+            resp = requests.get(
+                f"{BINANCE_REST}/api/v3/ticker/price", timeout=10
+            )
             resp.raise_for_status()
             return {d['symbol']: float(d['price']) for d in resp.json()}
         except Exception:
             return {}
 
+    # ─────────────────────────────────────────────────
+    # Stats & housekeeping
+    # ─────────────────────────────────────────────────
+
     def get_open_count(self) -> int:
-        csv_path = self.current_csv
-        if not csv_path.exists():
-            return 0
-        try:
-            df = pd.read_csv(csv_path)
-            return int((df.get('status', pd.Series()) == 'open').sum())
-        except Exception:
-            return 0
+        return sum(len(v) for v in self._open_positions.values())
+
+    def get_open_symbols(self) -> set[str]:
+        """Return set of symbols (UPPERCASE) that currently have an open trade."""
+        return {sym for sym, positions in self._open_positions.items() if positions}
 
     def get_stats_summary(self) -> str:
         """One-line summary of running stats."""
         if self.total_closed == 0:
-            return f"Signals: {self.total_signals} | Open: {self.get_open_count()} | No closed trades yet"
+            return (f"Signals: {self.total_signals} | "
+                    f"Open: {self.get_open_count()} | No closed trades yet")
         wr = self.total_wins / self.total_closed
         avg_pnl = self.total_pnl / self.total_closed
-        return (f"Signals: {self.total_signals} | Open: {self.get_open_count()} | "
-                f"Closed: {self.total_closed} | WR: {wr:.0%} | Avg PnL: {avg_pnl:+.2f}%")
+        return (
+            f"Signals: {self.total_signals} | Open: {self.get_open_count()} | "
+            f"Closed: {self.total_closed} | WR: {wr:.0%} | Avg PnL: {avg_pnl:+.2f}%"
+        )
 
     def cleanup_old_csvs(self, keep_months: int = 3) -> None:
         """Delete CSV files older than `keep_months`."""
@@ -199,12 +430,12 @@ class SignalStore:
             if f.name == 'signals_latest.csv':
                 continue
             try:
-                # Parse YYYY-MM from filename
                 parts = f.stem.split('_')
                 if len(parts) >= 2:
-                    file_date = datetime.strptime(parts[1], '%Y-%m').replace(tzinfo=timezone.utc)
-                    age_days = (now - file_date).days
-                    if age_days > keep_months * 31:
+                    file_date = datetime.strptime(
+                        parts[1], '%Y-%m'
+                    ).replace(tzinfo=timezone.utc)
+                    if (now - file_date).days > keep_months * 31:
                         f.unlink()
                         print(f"  [cleanup] Deleted old CSV: {f.name}")
             except Exception:

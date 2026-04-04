@@ -13,9 +13,21 @@ from src.features import build_features
 BINANCE_REST = "https://api.binance.com"
 
 EXCLUDE_COINS = {
+    # USD stablecoins
     'USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'BUSDUSDT', 'USDPUSDT',
-    'EURUSDT', 'AEURUSDT', 'GBPUSDT', 'DAIUSDT', 'USDTUSDT',
-    'USD1USDT', 'RLUSDUSDT', 'USDEUSDT',
+    'USDTUSDT', 'USD1USDT', 'RLUSDUSDT', 'USDEUSDT', 'DAIUSDT',
+    # Fiat-pegged
+    'EURUSDT', 'AEURUSDT', 'GBPUSDT',
+    # Gold / commodity tokens — tracks metals, not crypto sentiment
+    'PAXGUSDT', 'XAUTUSDT', 'XAGUUSDT',
+}
+
+# Large-cap coins: kept in universe for HTF context but excluded from signals.
+# Highly efficient markets — 1H ATR targets are too tight vs. spread + fees.
+LARGE_CAP_EXCLUDE = {
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT',
+    'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'LTCUSDT', 'BCHUSDT',
+    'LINKUSDT', 'DOTUSDT', 'XLMUSDT', 'AVAXUSDT', 'UNIUSDT',
 }
 
 MIN_QUOTE_VOLUME = 5_000_000  # $5M daily
@@ -109,7 +121,7 @@ class HTFCache:
     def __init__(self, full_refresh_interval: int = 3600):
         self._cache: dict[str, pd.DataFrame] = {}  # key: "BTCUSDT_1h"
         self._last_update: dict[str, float] = {}
-        self._stale_after: int = 900  # consider stale after 15 min
+        self._stale_after: int = 3600  # stale after 1H (matches primary TF candle close)
         self.full_refresh_interval = full_refresh_interval
         self._last_full_refresh = 0.0
 
@@ -145,7 +157,7 @@ class HTFCache:
             return
 
         for sym in symbols:
-            for interval in ['1h', '4h']:
+            for interval in ['4h', '1d']:
                 self.refresh_one(sym, interval)
                 time.sleep(0.1)  # rate limit
 
@@ -153,7 +165,7 @@ class HTFCache:
 
     def drop(self, symbol: str) -> None:
         """Remove a coin from cache."""
-        for interval in ['1h', '4h']:
+        for interval in ['4h', '1d']:
             key = f"{symbol}_{interval}"
             self._cache.pop(key, None)
             self._last_update.pop(key, None)
@@ -201,17 +213,18 @@ class CoinManager:
               f"~{self._total_memory_mb():.1f} MB memory")
 
     def _add_coin(self, symbol: str) -> bool:
-        """Add one coin: fetch 15m history + HTF context."""
+        """Add one coin: fetch 1H history + HTF context."""
         key = symbol.lower()
         if key in self.coin_states:
             return True
         try:
-            df = fetch_klines(symbol, '15m', 250)
+            # 1H is now the primary TF — fetch 300 candles (~12.5 days)
+            df = fetch_klines(symbol, '1h', 300)
             df = build_features(df)
             self.coin_states[key] = CoinState(symbol, df)
 
-            # Warm HTF cache
-            for interval in ['1h', '4h']:
+            # Warm HTF cache: 4H and 1D context for the 1H model
+            for interval in ['4h', '1d']:
                 self.htf_cache.refresh_one(symbol, interval)
 
             return True

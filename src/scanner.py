@@ -28,8 +28,8 @@ import numpy as np
 import joblib
 import requests
 
-from src.features import build_features, FEATURE_COLUMNS
-from src.coin_manager import CoinManager, CoinState, fetch_klines
+from src.features import build_features, compute_htf_features, FEATURE_COLUMNS, HTF_DERIVED_COLUMNS
+from src.coin_manager import CoinManager, CoinState, fetch_klines, LARGE_CAP_EXCLUDE
 from src.signal_store import SignalStore
 
 # Force unbuffered output
@@ -39,54 +39,97 @@ if hasattr(sys.stdout, 'reconfigure'):
 warnings.filterwarnings('ignore')
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
-MODEL_PATH = OUTPUT_DIR / "signal_model_15m.joblib"
+MODEL_PATH = OUTPUT_DIR / "signal_model.joblib"   # 1H ATR-relative model
 
 BINANCE_WS = "wss://stream.binance.com:9443"
 
-# ─── Optimized exit config (grid-searched on 15m data) ───
+# ─── Exit config for 1H ATR-relative model ───
+# TP and SL are computed per-signal from ATR (stored in signal dict).
+# These fallbacks are only used if ATR is unavailable.
+# Trailing stop activates when price rises by 1× SL distance above entry.
 EXIT_CONFIG = {
-    'initial_sl_pct': 0.007,
-    'trailing_activate_pct': 0.006,
-    'trailing_distance_pct': 0.004,
-    'tp_pct': 0.02,
-    'max_hold_minutes': 480,
+    'initial_sl_pct':       0.015,   # fallback: ~1.5% SL if ATR missing
+    'trailing_activate_pct': 0.015,  # activate trail after 1× SL move up
+    'trailing_distance_pct': 0.010,  # trail by 1% below peak
+    'tp_pct':               0.030,   # fallback: ~3% TP if ATR missing
+    'max_hold_minutes':     2880,    # 48 hours max hold on 1H entries
 }
 
 
 def load_model():
+    """Load model bundle and verify SHA-256 integrity hash."""
     if not MODEL_PATH.exists():
         print(f"ERROR: No model at {MODEL_PATH}")
         sys.exit(1)
+
+    # Integrity check
+    hash_path = MODEL_PATH.with_name(MODEL_PATH.name + '.sha256')
+    if hash_path.exists():
+        import hashlib
+        sha = hashlib.sha256()
+        with open(MODEL_PATH, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                sha.update(chunk)
+        actual = sha.hexdigest()
+        expected = hash_path.read_text().strip()
+        if actual != expected:
+            print(f"ERROR: Model integrity check failed! Expected {expected[:12]}… got {actual[:12]}…")
+            sys.exit(1)
+        print(f"  Model integrity: OK ({actual[:12]}…)")
+
     bundle = joblib.load(MODEL_PATH)
-    return bundle['model'], bundle['feature_cols'], bundle.get('threshold', 0.65)
+    model       = bundle['model']
+    feature_cols = bundle['feature_cols']
+    threshold   = bundle.get('threshold', 0.65)
+    atr_config  = bundle.get('config', {'tp_atr_mult': 2.0, 'sl_atr_mult': 1.0})
+    print(f"  Model loaded: {len(feature_cols)} features | threshold={threshold} | "
+          f"TP={atr_config['tp_atr_mult']}×ATR SL={atr_config['sl_atr_mult']}×ATR")
+    return model, feature_cols, threshold, atr_config
 
 
 def predict_signal(
     coin_state: CoinState,
     htf_cache,
+    store,
     model,
     feature_cols: list[str],
     threshold: float,
+    atr_config: dict,
 ) -> dict | None:
-    """Check latest candle for a high-confidence signal."""
+    """Check latest candle for a high-confidence signal.
+
+    No-re-entry: skips if coin already has an open trade in SignalStore.
+    ATR-relative TP/SL: computed from current ATR × model multipliers.
+    HTF context: 4H and 1D merged into 1H row before prediction.
+    """
+    sym = coin_state.symbol
+
+    # Skip large-cap coins — model has no edge on efficient markets
+    if sym in LARGE_CAP_EXCLUDE:
+        return None
+
     df = coin_state.df
     latest = df.iloc[-1]
 
     if not latest.get('any_bull_signal', False):
         return None
 
-    # Dedup: no repeat signals within 30 min
+    # No re-entry: skip if this coin already has an open trade
+    if store._open_positions.get(sym):
+        return None
+
+    # Dedup: no repeat signals within one 1H candle (3600s)
     if coin_state.last_signal_time:
         gap = (latest['open_time'] - coin_state.last_signal_time).total_seconds()
-        if gap < 1800:
+        if gap < 3600:
             return None
 
-    # Merge higher TF context (lazy — only fetched if needed)
+    # Merge 4H and 1D context (backward-looking, no look-ahead bias)
     htf_merge_cols = ['rsi', 'macd_hist', 'ema_50_slope', 'close_vs_ema50', 'ema_50_above_200']
     row_data = df.iloc[[-1]].copy()
 
-    for interval, suffix in [('1h', '_1h'), ('4h', '_4h')]:
-        htf_df = htf_cache.ensure_fresh(coin_state.symbol, interval)
+    for interval, suffix in [('4h', '_4h'), ('1d', '_1d')]:
+        htf_df = htf_cache.ensure_fresh(sym, interval)
         if htf_df is not None:
             available = [c for c in htf_merge_cols if c in htf_df.columns]
             if available:
@@ -96,47 +139,67 @@ def predict_signal(
                 row_data = row_data.sort_values('open_time')
                 row_data = pd.merge_asof(row_data, htf_sub, on='open_time', direction='backward')
 
-    # Prepare features
-    avail = [c for c in feature_cols if c in row_data.columns]
-    missing = set(feature_cols) - set(avail)
-    X = row_data[avail].copy()
-    for c in avail:
-        if X[c].dtype == bool:
+    # Cross-TF derived features (htf_trend_aligned, rsi_htf_diff_4h, etc.)
+    row_data = compute_htf_features(row_data)
+
+    # Assemble feature vector — fill missing with 0 (graceful degradation)
+    X = row_data.copy()
+    for c in feature_cols:
+        if c not in X.columns:
+            X[c] = 0
+        elif X[c].dtype == bool:
             X[c] = X[c].astype(int)
-    for c in missing:
-        X[c] = 0
     X = X[feature_cols].fillna(0)
 
     proba = model.predict_proba(X)[:, 1][0]
 
     if proba >= threshold:
         entry_price = float(latest['close'])
-        limit_entry = round((entry_price + float(latest['low'])) / 2, 6)
+        atr_val     = float(latest.get('atr', 0))
+
+        # ATR-relative TP/SL — same logic as labeling used during training
+        if atr_val > 0:
+            tp = entry_price + atr_config['tp_atr_mult'] * atr_val
+            sl = entry_price - atr_config['sl_atr_mult'] * atr_val
+            # Trailing activates when price rises by 1× SL distance (break-even territory)
+            trail_activate = entry_price + atr_config['sl_atr_mult'] * atr_val
+            trail_distance = atr_val * 0.5   # trail 0.5× ATR below peak
+        else:
+            # Fallback to fixed percentages if ATR is zero/missing
+            tp = entry_price * (1 + EXIT_CONFIG['tp_pct'])
+            sl = entry_price * (1 - EXIT_CONFIG['initial_sl_pct'])
+            trail_activate = entry_price * (1 + EXIT_CONFIG['trailing_activate_pct'])
+            trail_distance = entry_price * EXIT_CONFIG['trailing_distance_pct']
+
+        limit_entry = round((entry_price + float(latest['low'])) / 2, 8)
         coin_state.last_signal_time = latest['open_time']
 
         return {
-            'symbol': coin_state.symbol,
-            'signal_time': latest['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC'),
-            'entry_price': entry_price,
-            'limit_entry': limit_entry,
-            'confidence': round(float(proba), 4),
-            'rsi': round(float(latest.get('rsi', 0)), 1),
-            'macd_hist': round(float(latest.get('macd_hist', 0)), 6),
-            'vol_spike_ratio': round(float(latest.get('vol_spike_ratio', 0)), 2),
-            'signal_count': int(latest.get('bull_signal_count', 0)),
-            'rsi_cross': bool(latest.get('rsi_cross_up', False)),
-            'macd_cross': bool(latest.get('macd_cross_up', False)),
-            'ema_cross': bool(latest.get('ema_9_21_cross_up', False)),
-            'vol_spike': bool(latest.get('vol_spike', False)),
-            'stop_loss': round(entry_price * (1 - EXIT_CONFIG['initial_sl_pct']), 6),
-            'trailing_activate': round(entry_price * (1 + EXIT_CONFIG['trailing_activate_pct']), 6),
-            'take_profit': round(entry_price * (1 + EXIT_CONFIG['tp_pct']), 6),
-            'status': 'open',
-            'peak_price': entry_price,
-            'exit_price': '',
-            'exit_time': '',
-            'exit_reason': '',
-            'pnl_pct': '',
+            'symbol':           sym,
+            'signal_time':      latest['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'entry_price':      round(entry_price, 8),
+            'limit_entry':      round(limit_entry, 8),
+            'confidence':       round(float(proba), 4),
+            'atr':              round(atr_val, 8),
+            'rsi':              round(float(latest.get('rsi', 0)), 1),
+            'macd_hist':        round(float(latest.get('macd_hist', 0)), 8),
+            'vol_spike_ratio':  round(float(latest.get('vol_spike_ratio', 0)), 2),
+            'signal_count':     int(latest.get('bull_signal_count', 0)),
+            'rsi_cross':        bool(latest.get('rsi_cross_up', False)),
+            'macd_cross':       bool(latest.get('macd_cross_up', False)),
+            'ema_cross':        bool(latest.get('ema_9_21_cross_up', False)),
+            'vol_spike':        bool(latest.get('vol_spike', False)),
+            # ATR-relative exit levels (absolute prices stored per-trade)
+            'stop_loss':        round(sl, 8),
+            'take_profit':      round(tp, 8),
+            'trailing_activate': round(trail_activate, 8),
+            'trailing_distance': round(trail_distance, 8),
+            'status':           'open',
+            'peak_price':       entry_price,
+            'exit_price':       '',
+            'exit_time':        '',
+            'exit_reason':      '',
+            'pnl_pct':          '',
         }
 
     return None
@@ -178,7 +241,7 @@ def log_signal(signal: dict) -> None:
 # ─────────────────────────────────────────────────
 
 async def run_ws(coin_mgr: CoinManager, store: SignalStore,
-                 model, feature_cols, threshold: float):
+                 model, feature_cols, threshold: float, atr_config: dict):
     """WebSocket event loop with dynamic coin refresh."""
     import websockets
 
@@ -191,7 +254,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
     while True:
         # Build stream URL from current coin list
         symbols = coin_mgr.get_active_symbols()
-        streams = [f"{s.lower()}@kline_15m" for s in symbols]
+        streams = [f"{s.lower()}@kline_1h" for s in symbols]
         stream_path = "/".join(streams[:200])  # Binance limit: 200 per connection
         url = f"{BINANCE_WS}/stream?streams={stream_path}"
 
@@ -233,11 +296,22 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         continue
 
                     kline = data['k']
-                    if not kline['x']:  # not closed yet
+                    sym_upper = kline['s']
+
+                    # ─── Live exit check on EVERY tick (open or closed candle) ───
+                    # Fires SL/TP at the exact trigger price, not 60s later.
+                    live_price = float(kline['c'])
+                    live_exits = store.check_exits_live(sym_upper, live_price)
+                    for t in live_exits:
+                        print(f"  LIVE EXIT {t['symbol']}: {t['reason']} | "
+                              f"Entry={t['entry']:.6f} | Exit={t['exit']:.6f} | "
+                              f"PnL={t['pnl']:+.2f}%")
+
+                    if not kline['x']:  # candle not closed — skip signal processing
                         continue
 
-                    # ─── Candle closed — process ───
-                    sym_lower = kline['s'].lower()
+                    # ─── Candle closed — process signal ───
+                    sym_lower = sym_upper.lower()
                     state = coin_mgr.coin_states.get(sym_lower)
                     if state is None:
                         continue
@@ -245,7 +319,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                     state.append_candle(parse_ws_candle(kline))
 
                     signal = predict_signal(
-                        state, coin_mgr.htf_cache, model, feature_cols, threshold
+                        state, coin_mgr.htf_cache, store, model, feature_cols, threshold, atr_config
                     )
                     if signal:
                         is_new = store.save_signal(signal)
@@ -280,7 +354,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 # ─────────────────────────────────────────────────
 
 def run_poll(coin_mgr: CoinManager, store: SignalStore,
-             model, feature_cols, threshold: float, interval: int = 60):
+             model, feature_cols, threshold: float, atr_config: dict, interval: int = 60):
     """REST polling loop."""
     last_candle_times: dict[str, pd.Timestamp] = {}
 
@@ -310,7 +384,7 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
             for key, state in list(coin_mgr.coin_states.items()):
                 sym = state.symbol
                 try:
-                    df_new = fetch_klines(sym, '15m', 5)
+                    df_new = fetch_klines(sym, '1h', 5)
                     latest_time = df_new.iloc[-1]['open_time']
 
                     if latest_time <= last_candle_times.get(sym, pd.Timestamp.min.tz_localize('UTC')):
@@ -322,11 +396,11 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
                     new_rows = df_new[~df_new['open_time'].isin(existing_times)]
                     if len(new_rows) > 0:
                         state.df = pd.concat([state.df, new_rows], ignore_index=True)
-                        if len(state.df) > 250:
-                            state.df = state.df.iloc[-250:].reset_index(drop=True)
+                        if len(state.df) > 300:
+                            state.df = state.df.iloc[-300:].reset_index(drop=True)
                         state.df = build_features(state.df)
 
-                    signal = predict_signal(state, coin_mgr.htf_cache, model, feature_cols, threshold)
+                    signal = predict_signal(state, coin_mgr.htf_cache, store, model, feature_cols, threshold, atr_config)
                     if signal:
                         is_new = store.save_signal(signal)
                         if is_new:
@@ -371,7 +445,10 @@ def main():
     parser.add_argument('--poll-interval', type=int, default=60)
     args = parser.parse_args()
 
-    model, feature_cols, _ = load_model()
+    model, feature_cols, threshold, atr_config = load_model()
+    # CLI threshold overrides model default if explicitly set
+    if args.threshold != 0.65:
+        threshold = args.threshold
     store = SignalStore(OUTPUT_DIR, EXIT_CONFIG)
     coin_mgr = CoinManager(top_n=args.top, refresh_interval=3600)
 
@@ -384,10 +461,9 @@ def main():
 
     print(f"{'='*60}")
     print(f"  CRYPTO SIGNAL SCANNER")
-    print(f"  Mode: {args.mode.upper()} | Threshold: {args.threshold} | Top: {args.top}")
-    print(f"  Exit: SL={EXIT_CONFIG['initial_sl_pct']:.1%} "
-          f"Trail={EXIT_CONFIG['trailing_distance_pct']:.1%} "
-          f"TP={EXIT_CONFIG['tp_pct']:.1%}")
+    print(f"  Mode: {args.mode.upper()} | Threshold: {threshold} | Top: {args.top}")
+    print(f"  ATR TP={atr_config['tp_atr_mult']}× SL={atr_config['sl_atr_mult']}× "
+          f"| Fallback SL={EXIT_CONFIG['initial_sl_pct']:.1%} TP={EXIT_CONFIG['tp_pct']:.1%}")
     print(f"  CSV: {store.current_csv}")
     print(f"{'='*60}")
 
@@ -396,11 +472,11 @@ def main():
 
     if args.mode == 'ws':
         try:
-            asyncio.run(run_ws(coin_mgr, store, model, feature_cols, args.threshold))
+            asyncio.run(run_ws(coin_mgr, store, model, feature_cols, threshold, atr_config))
         except KeyboardInterrupt:
             print("\nScanner stopped.")
     else:
-        run_poll(coin_mgr, store, model, feature_cols, args.threshold, args.poll_interval)
+        run_poll(coin_mgr, store, model, feature_cols, threshold, atr_config, args.poll_interval)
 
 
 if __name__ == '__main__':
