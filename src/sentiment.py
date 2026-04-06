@@ -413,22 +413,22 @@ class SentimentScorer:
 
     def print_status(self, snap: dict) -> None:
         """Print one-line sentiment summary to console."""
-        rsi    = snap.get('sent_btc_4h_rsi')
-        basis  = snap.get('sent_basis')
-        ls     = snap.get('sent_ls_ratio')
-        oi     = snap.get('sent_oi_delta')
-        brd    = snap.get('sent_breadth')
-        score  = snap.get('sent_score', '?')
-        thr    = snap.get('sent_threshold', '?')
+        rsi   = snap.get('sent_btc_4h_rsi')
+        basis = snap.get('sent_basis')
+        ls    = snap.get('sent_ls_ratio')
+        oi    = snap.get('sent_oi_delta')
+        brd   = snap.get('sent_breadth')
+        score = snap.get('sent_score', '?')
+        thr   = snap.get('sent_threshold', '?')
 
-        rsi_s   = f"{rsi:.0f}"   if rsi   is not None else "N/A"
-        basis_s = f"{basis*100:+.3f}%" if basis is not None else "N/A"
-        ls_s    = f"{ls:.2f}"    if ls    is not None else "N/A"
-        oi_s    = f"{oi:+.1f}%"  if oi    is not None else "N/A"
-        brd_s   = f"{brd:.0f}%"  if brd   is not None else "N/A"
+        rsi_s   = f"{rsi:.0f}"          if rsi   is not None else "N/A"
+        basis_s = f"{basis * 100:+.3f}%" if basis is not None else "N/A"
+        ls_s    = f"{ls:.2f}"            if ls    is not None else "N/A"
+        oi_s    = f"{oi:+.1f}%"          if oi    is not None else "N/A"
+        brd_s   = f"{brd:.0f}%"          if brd   is not None else "N/A"
 
         print(
-            f"  [Sentiment] score={score:+d} thr={thr} | "
+            f"  [Sentiment] score={score:+} thr={thr} | "
             f"BTC4hRSI={rsi_s} basis={basis_s} L/S={ls_s} "
-            f"OIΔ={oi_s} breadth={brd_s}"
+            f"OI\u0394={oi_s} breadth={brd_s}"
         )

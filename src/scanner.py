@@ -20,7 +20,7 @@ import time
 import asyncio
 import argparse
 import warnings
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +32,7 @@ from src.features import build_features, compute_htf_features, FEATURE_COLUMNS, 
 from src.coin_manager import CoinManager, CoinState, fetch_klines, LARGE_CAP_EXCLUDE
 from src.signal_store import SignalStore
 from src.sentiment import SentimentScorer
+from src.notifier import TelegramNotifier
 
 # Force unbuffered output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -40,6 +41,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 warnings.filterwarnings('ignore')
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
+IST = timezone(timedelta(hours=5, minutes=30))   # UTC+5:30
 MODEL_PATH = OUTPUT_DIR / "signal_model.joblib"   # 1H ATR-relative model
 
 BINANCE_WS = "wss://stream.binance.com:9443"
@@ -157,10 +159,18 @@ def predict_signal(
 
     proba = model.predict_proba(X)[:, 1][0]
 
-    # ── Sentiment-adjusted threshold ─────────────────────────────────
-    # Evaluate sentiment BEFORE checking proba so we can gate even
-    # high-confidence signals during crash regimes (score ≤ -5 → None).
+    # ── Base model threshold check ────────────────────────────────────
+    # If the model itself isn't confident enough, nothing to log — return.
+    if proba < threshold:
+        return None
+
+    # ── Sentiment evaluation ──────────────────────────────────────────
+    # Always evaluate sentiment so we can log the snapshot with every signal.
+    # Sentiment can only BLOCK or RAISE the bar — it never fires a signal by
+    # itself. Blocked signals still get logged to CSV for future training.
     sentiment_snapshot: dict = {}
+    sentiment_blocked  = False
+    block_reason       = ''
     effective_threshold = threshold
 
     if scorer is not None:
@@ -169,67 +179,73 @@ def predict_signal(
             base_threshold=threshold,
         )
         if adj_threshold is None:
-            # Hard gate: market in crash regime — block all new longs
-            return None
-        # Use whichever is stricter: model default vs sentiment-adjusted
-        effective_threshold = max(threshold, adj_threshold)
-
-    if proba >= effective_threshold:
-        entry_price = float(latest['close'])
-        atr_val     = float(latest.get('atr', 0))
-
-        # ATR-relative TP/SL — same logic as labeling used during training
-        if atr_val > 0:
-            tp = entry_price + atr_config['tp_atr_mult'] * atr_val
-            sl = entry_price - atr_config['sl_atr_mult'] * atr_val
-            # Trailing activates when price rises by 1× SL distance (break-even territory)
-            trail_activate = entry_price + atr_config['sl_atr_mult'] * atr_val
-            trail_distance = atr_val * 0.5   # trail 0.5× ATR below peak
+            # Hard gate: market in crash regime
+            sentiment_blocked = True
+            score = sentiment_snapshot.get('sent_score', '?')
+            block_reason = f'hard_gate(score={score})'
+        elif proba < adj_threshold:
+            # Confidence below sentiment-adjusted bar
+            sentiment_blocked = True
+            score = sentiment_snapshot.get('sent_score', '?')
+            block_reason = f'sent_thr={adj_threshold}(score={score},conf={proba:.3f})'
         else:
-            # Fallback to fixed percentages if ATR is zero/missing
-            tp = entry_price * (1 + EXIT_CONFIG['tp_pct'])
-            sl = entry_price * (1 - EXIT_CONFIG['initial_sl_pct'])
-            trail_activate = entry_price * (1 + EXIT_CONFIG['trailing_activate_pct'])
-            trail_distance = entry_price * EXIT_CONFIG['trailing_distance_pct']
+            effective_threshold = max(threshold, adj_threshold)
 
-        limit_entry = round((entry_price + float(latest['low'])) / 2, 8)
-        coin_state.last_signal_time = latest['open_time']
+    # ── Build signal dict ─────────────────────────────────────────────
+    entry_price = float(latest['close'])
+    atr_val     = float(latest.get('atr', 0))
 
-        signal = {
-            'symbol':           sym,
-            'signal_time':      latest['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC'),
-            'entry_price':      round(entry_price, 8),
-            'limit_entry':      round(limit_entry, 8),
-            'confidence':       round(float(proba), 4),
-            'atr':              round(atr_val, 8),
-            'rsi':              round(float(latest.get('rsi', 0)), 1),
-            'macd_hist':        round(float(latest.get('macd_hist', 0)), 8),
-            'vol_spike_ratio':  round(float(latest.get('vol_spike_ratio', 0)), 2),
-            'signal_count':     int(latest.get('bull_signal_count', 0)),
-            'rsi_cross':        bool(latest.get('rsi_cross_up', False)),
-            'macd_cross':       bool(latest.get('macd_cross_up', False)),
-            'ema_cross':        bool(latest.get('ema_9_21_cross_up', False)),
-            'vol_spike':        bool(latest.get('vol_spike', False)),
-            # ATR-relative exit levels (absolute prices stored per-trade)
-            'stop_loss':        round(sl, 8),
-            'take_profit':      round(tp, 8),
-            'trailing_activate': round(trail_activate, 8),
-            'trailing_distance': round(trail_distance, 8),
-            'status':           'open',
-            'peak_price':       entry_price,
-            'exit_price':       '',
-            'exit_time':        '',
-            'exit_reason':      '',
-            'pnl_pct':          '',
-        }
+    if atr_val > 0:
+        tp = entry_price + atr_config['tp_atr_mult'] * atr_val
+        sl = entry_price - atr_config['sl_atr_mult'] * atr_val
+        trail_activate = entry_price + atr_config['sl_atr_mult'] * atr_val
+        trail_distance = atr_val * 0.5
+    else:
+        tp = entry_price * (1 + EXIT_CONFIG['tp_pct'])
+        sl = entry_price * (1 - EXIT_CONFIG['initial_sl_pct'])
+        trail_activate = entry_price * (1 + EXIT_CONFIG['trailing_activate_pct'])
+        trail_distance = entry_price * EXIT_CONFIG['trailing_distance_pct']
 
-        # Attach sentiment snapshot for CSV logging (future logistic regression training)
-        if sentiment_snapshot:
-            signal.update(sentiment_snapshot)
+    limit_entry = round((entry_price + float(latest['low'])) / 2, 8)
+    coin_state.last_signal_time = latest['open_time']
 
-        return signal
+    # IST timestamp for all display / CSV columns
+    signal_time_ist = latest['open_time'].astimezone(IST).strftime('%Y-%m-%d %H:%M:%S IST')
 
-    return None
+    signal = {
+        'symbol':            sym,
+        'signal_time':       signal_time_ist,
+        'entry_price':       round(entry_price, 8),
+        'limit_entry':       round(limit_entry, 8),
+        'confidence':        round(float(proba), 4),
+        'atr':               round(atr_val, 8),
+        'rsi':               round(float(latest.get('rsi', 0)), 1),
+        'macd_hist':         round(float(latest.get('macd_hist', 0)), 8),
+        'vol_spike_ratio':   round(float(latest.get('vol_spike_ratio', 0)), 2),
+        'signal_count':      int(latest.get('bull_signal_count', 0)),
+        'rsi_cross':         bool(latest.get('rsi_cross_up', False)),
+        'macd_cross':        bool(latest.get('macd_cross_up', False)),
+        'ema_cross':         bool(latest.get('ema_9_21_cross_up', False)),
+        'vol_spike':         bool(latest.get('vol_spike', False)),
+        'stop_loss':         round(sl, 8),
+        'take_profit':       round(tp, 8),
+        'trailing_activate': round(trail_activate, 8),
+        'trailing_distance': round(trail_distance, 8),
+        # Blocked signals get status='blocked'; open signals get exit tracking
+        'status':            'blocked' if sentiment_blocked else 'open',
+        'block_reason':      block_reason,
+        'peak_price':        entry_price,
+        'exit_price':        '',
+        'exit_time':         '',
+        'exit_reason':       '',
+        'pnl_pct':           '',
+    }
+
+    # Sentiment snapshot always attached (for logistic regression training)
+    if sentiment_snapshot:
+        signal.update(sentiment_snapshot)
+
+    return signal
 
 
 def parse_ws_candle(kline: dict) -> dict:
@@ -249,10 +265,12 @@ def parse_ws_candle(kline: dict) -> dict:
     }
 
 
-def log_signal(signal: dict) -> None:
-    """Pretty-print a signal to console."""
-    now_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
-    print(f"\n  [{now_str}] SIGNAL: {signal['symbol']} @ {signal['entry_price']:.4f}")
+def log_signal(signal: dict, notifier: TelegramNotifier | None = None) -> None:
+    """Pretty-print a live tradeable signal to console and send Telegram alert."""
+    now_ist    = datetime.now(IST).strftime('%H:%M:%S')
+    sent_score = signal.get('sent_score', 'N/A')
+    sent_thr   = signal.get('sent_threshold', 'N/A')
+    print(f"\n  [{now_ist} IST] 🟢 SIGNAL: {signal['symbol']} @ {signal['entry_price']:.4f}")
     print(f"    Conf: {signal['confidence']:.2f} | "
           f"Signals: {signal['signal_count']} "
           f"(RSI={signal['rsi_cross']} MACD={signal['macd_cross']} "
@@ -261,6 +279,20 @@ def log_signal(signal: dict) -> None:
           f"Trail@: {signal['trailing_activate']:.4f} | "
           f"TP: {signal['take_profit']:.4f} | "
           f"LimitEntry: {signal['limit_entry']:.4f}")
+    print(f"    Sentiment: score={sent_score} | thr={sent_thr}")
+    if notifier:
+        notifier.send_signal(signal)
+
+
+def log_blocked_signal(signal: dict, notifier: TelegramNotifier | None = None) -> None:
+    """Print a sentiment-blocked signal (logged to CSV but do not trade)."""
+    now_ist    = datetime.now(IST).strftime('%H:%M:%S')
+    reason     = signal.get('block_reason', '?')
+    sent_score = signal.get('sent_score', 'N/A')
+    print(f"\n  [{now_ist} IST] 🔴 BLOCKED: {signal['symbol']} @ {signal['entry_price']:.4f} "
+          f"| conf={signal['confidence']:.2f} | {reason} | score={sent_score}  (logged, not traded)")
+    if notifier:
+        notifier.send_blocked(signal)
 
 
 # ─────────────────────────────────────────────────
@@ -269,18 +301,20 @@ def log_signal(signal: dict) -> None:
 
 async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                  model, feature_cols, threshold: float, atr_config: dict,
-                 scorer: SentimentScorer | None = None):
+                 scorer: SentimentScorer | None = None,
+                 notifier: TelegramNotifier | None = None):
     """WebSocket event loop with dynamic coin refresh."""
     import websockets
 
     exit_interval = 60
     coin_refresh_interval = 3600
     sentiment_interval = 300   # print sentiment summary every 5 min
-    last_exit_check     = time.time()
-    last_coin_refresh   = time.time()
-    last_status_print   = time.time()
-    last_sentiment_print = time.time()
-    _breadth_pct: float | None = None   # shared across candles, updated with ticker refresh
+    last_exit_check        = time.time()
+    last_coin_refresh      = time.time()
+    last_status_print      = time.time()
+    last_sentiment_print   = time.time()
+    last_sentiment_telegram = time.time()   # Telegram sentiment update every 30 min
+    _breadth_pct: float | None = None       # shared across candles, updated with ticker refresh
 
     while True:
         # Build stream URL from current coin list
@@ -318,9 +352,13 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                             _, snap = scorer.evaluate(breadth_pct=_breadth_pct)
                             scorer.print_status(snap)
                             last_sentiment_print = now
+                            # Telegram: push sentiment update every 30 min
+                            if notifier and now - last_sentiment_telegram >= 1800:
+                                notifier.send_sentiment(snap)
+                                last_sentiment_telegram = now
 
                         if now - last_status_print >= 900:
-                            print(f"  [{datetime.now(timezone.utc).strftime('%H:%M')}] "
+                            print(f"  [{datetime.now(IST).strftime('%H:%M IST')}] "
                                   f"{store.get_stats_summary()}")
                             last_status_print = now
                         continue
@@ -342,6 +380,8 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         print(f"  LIVE EXIT {t['symbol']}: {t['reason']} | "
                               f"Entry={t['entry']:.6f} | Exit={t['exit']:.6f} | "
                               f"PnL={t['pnl']:+.2f}%")
+                        if notifier:
+                            notifier.send_exit(t)
 
                     if not kline['x']:  # candle not closed — skip signal processing
                         continue
@@ -362,7 +402,10 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                     if signal:
                         is_new = store.save_signal(signal)
                         if is_new:
-                            log_signal(signal)
+                            if signal.get('status') == 'blocked':
+                                log_blocked_signal(signal, notifier)
+                            else:
+                                log_signal(signal, notifier)
 
                     # Periodic checks
                     now = time.time()
@@ -370,6 +413,8 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         closed = store.check_exits()
                         for t in closed:
                             print(f"  EXIT {t['symbol']}: {t['reason']} | PnL={t['pnl']:+.2f}%")
+                            if notifier:
+                                notifier.send_exit(t)
                         last_exit_check = now
 
                     if now - last_coin_refresh >= coin_refresh_interval:
@@ -382,6 +427,9 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         _, snap = scorer.evaluate(breadth_pct=_breadth_pct)
                         scorer.print_status(snap)
                         last_sentiment_print = now
+                        if notifier and now - last_sentiment_telegram >= 1800:
+                            notifier.send_sentiment(snap)
+                            last_sentiment_telegram = now
 
         except (Exception,) as e:
             if not reconnect:
@@ -418,7 +466,8 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 
 def run_poll(coin_mgr: CoinManager, store: SignalStore,
              model, feature_cols, threshold: float, atr_config: dict,
-             interval: int = 60, scorer: SentimentScorer | None = None):
+             interval: int = 60, scorer: SentimentScorer | None = None,
+             notifier: TelegramNotifier | None = None):
     """REST polling loop."""
     last_candle_times: dict[str, pd.Timestamp] = {}
 
@@ -472,7 +521,10 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
                         is_new = store.save_signal(signal)
                         if is_new:
                             signals_found += 1
-                            log_signal(signal)
+                            if signal.get('status') == 'blocked':
+                                log_blocked_signal(signal)
+                            else:
+                                log_signal(signal)
                 except Exception:
                     continue
                 time.sleep(0.1)
@@ -481,6 +533,8 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
             closed = store.check_exits()
             for t in closed:
                 print(f"  EXIT {t['symbol']}: {t['reason']} | PnL={t['pnl']:+.2f}%")
+                if notifier:
+                    notifier.send_exit(t)
 
             # Refresh HTF
             if time.time() >= htf_refresh_at:
@@ -489,7 +543,7 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
 
             elapsed = time.time() - t0
             if signals_found or int(time.time()) % 900 < interval:
-                print(f"  [{datetime.now(timezone.utc).strftime('%H:%M')}] "
+                print(f"  [{datetime.now(IST).strftime('%H:%M IST')}] "
                       f"{store.get_stats_summary()}")
 
             time.sleep(max(1, interval - elapsed))
@@ -529,6 +583,9 @@ def main():
     # Initialise sentiment scorer
     scorer = SentimentScorer()
 
+    # Initialise Telegram notifier (reads TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from env)
+    notifier = TelegramNotifier()
+
     # Warm up sentiment on startup (prints initial reading)
     try:
         _, snap = scorer.evaluate()
@@ -547,15 +604,18 @@ def main():
 
     coin_mgr.warmup(symbols)
 
+    # Send startup ping so you know the scanner is live on your phone
+    notifier.send_startup(threshold, args.top, args.mode)
+
     if args.mode == 'ws':
         asyncio.run(run_ws(
             coin_mgr, store, model, feature_cols, threshold, atr_config,
-            scorer=scorer,
+            scorer=scorer, notifier=notifier,
         ))
     else:
         run_poll(
             coin_mgr, store, model, feature_cols, threshold, atr_config,
-            interval=args.poll_interval, scorer=scorer,
+            interval=args.poll_interval, scorer=scorer, notifier=notifier,
         )
 
 

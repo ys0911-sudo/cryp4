@@ -29,7 +29,9 @@ Exit price accuracy:
     time_exit     → live market price             (no trigger level exists)
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))   # UTC+5:30
 from pathlib import Path
 
 import pandas as pd
@@ -96,7 +98,7 @@ class SignalStore:
     @property
     def current_csv(self) -> Path:
         """Current month's CSV file. Rotates monthly."""
-        month_str = datetime.now(timezone.utc).strftime('%Y-%m')
+        month_str = datetime.now(IST).strftime('%Y-%m')
         return self.output_dir / f"signals_{month_str}.csv"
 
     @property
@@ -128,10 +130,12 @@ class SignalStore:
         df_out.to_csv(csv_path, index=False)
         df_out.to_csv(self.latest_csv, index=False)
 
-        # Register in in-memory open positions
-        pos = dict(signal)
-        pos['peak_price'] = pos.get('peak_price') or pos['entry_price']
-        self._open_positions.setdefault(signal['symbol'], []).append(pos)
+        # Blocked signals are logged to CSV for training data but not tracked
+        # as open positions (we never entered the trade)
+        if signal.get('status') != 'blocked':
+            pos = dict(signal)
+            pos['peak_price'] = pos.get('peak_price') or pos['entry_price']
+            self._open_positions.setdefault(signal['symbol'], []).append(pos)
 
         self.total_signals += 1
         return True
@@ -179,7 +183,7 @@ class SignalStore:
                 pos.update({
                     'status':      'closed',
                     'exit_price':  round(exit_price, 8),
-                    'exit_time':   now.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'exit_time':   now.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S IST'),
                     'exit_reason': exit_reason,
                     'pnl_pct':     pnl,
                     'peak_price':  round(peak, 8),
@@ -381,9 +385,11 @@ class SignalStore:
             return 'take_profit'
 
         # 4. Time exit
-        signal_time = pd.to_datetime(pos['signal_time'])
+        raw_st = str(pos['signal_time']).replace(' IST', '').replace(' UTC', '')
+        signal_time = pd.to_datetime(raw_st)
         if signal_time.tzinfo is None:
-            signal_time = signal_time.replace(tzinfo=timezone.utc)
+            # IST-formatted strings: subtract 5:30 to get UTC for hold duration math
+            signal_time = signal_time.replace(tzinfo=IST)
         mins_held = (now - signal_time).total_seconds() / 60
         if mins_held >= cfg['max_hold_minutes']:
             return 'time_exit'
@@ -431,13 +437,13 @@ class SignalStore:
             if f.name == 'signals_latest.csv':
                 continue
             try:
-                parts = f.stem.split('_')
-                if len(parts) >= 2:
-                    file_date = datetime.strptime(
-                        parts[1], '%Y-%m'
-                    ).replace(tzinfo=timezone.utc)
-                    if (now - file_date).days > keep_months * 31:
-                        f.unlink()
-                        print(f"  [cleanup] Deleted old CSV: {f.name}")
+                parts = f.stem.split('_')   # signals_2026-04 → ['signals', '2026-04']
+                if len(parts) < 2:
+                    continue
+                file_month = datetime.strptime(parts[1], '%Y-%m').replace(tzinfo=timezone.utc)
+                months_old = (now.year - file_month.year) * 12 + (now.month - file_month.month)
+                if months_old > keep_months:
+                    f.unlink()
+                    print(f"  [store] Deleted old CSV: {f.name}")
             except Exception:
                 continue
