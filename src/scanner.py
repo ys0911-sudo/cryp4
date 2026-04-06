@@ -31,6 +31,7 @@ import requests
 from src.features import build_features, compute_htf_features, FEATURE_COLUMNS, HTF_DERIVED_COLUMNS
 from src.coin_manager import CoinManager, CoinState, fetch_klines, LARGE_CAP_EXCLUDE
 from src.signal_store import SignalStore
+from src.sentiment import SentimentScorer
 
 # Force unbuffered output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -95,12 +96,15 @@ def predict_signal(
     feature_cols: list[str],
     threshold: float,
     atr_config: dict,
+    scorer: SentimentScorer | None = None,
+    breadth_pct: float | None = None,
 ) -> dict | None:
     """Check latest candle for a high-confidence signal.
 
     No-re-entry: skips if coin already has an open trade in SignalStore.
     ATR-relative TP/SL: computed from current ATR × model multipliers.
     HTF context: 4H and 1D merged into 1H row before prediction.
+    Sentiment: if scorer provided, applies adaptive threshold gating.
     """
     sym = coin_state.symbol
 
@@ -153,7 +157,24 @@ def predict_signal(
 
     proba = model.predict_proba(X)[:, 1][0]
 
-    if proba >= threshold:
+    # ── Sentiment-adjusted threshold ─────────────────────────────────
+    # Evaluate sentiment BEFORE checking proba so we can gate even
+    # high-confidence signals during crash regimes (score ≤ -5 → None).
+    sentiment_snapshot: dict = {}
+    effective_threshold = threshold
+
+    if scorer is not None:
+        adj_threshold, sentiment_snapshot = scorer.evaluate(
+            breadth_pct=breadth_pct,
+            base_threshold=threshold,
+        )
+        if adj_threshold is None:
+            # Hard gate: market in crash regime — block all new longs
+            return None
+        # Use whichever is stricter: model default vs sentiment-adjusted
+        effective_threshold = max(threshold, adj_threshold)
+
+    if proba >= effective_threshold:
         entry_price = float(latest['close'])
         atr_val     = float(latest.get('atr', 0))
 
@@ -174,7 +195,7 @@ def predict_signal(
         limit_entry = round((entry_price + float(latest['low'])) / 2, 8)
         coin_state.last_signal_time = latest['open_time']
 
-        return {
+        signal = {
             'symbol':           sym,
             'signal_time':      latest['open_time'].strftime('%Y-%m-%d %H:%M:%S UTC'),
             'entry_price':      round(entry_price, 8),
@@ -201,6 +222,12 @@ def predict_signal(
             'exit_reason':      '',
             'pnl_pct':          '',
         }
+
+        # Attach sentiment snapshot for CSV logging (future logistic regression training)
+        if sentiment_snapshot:
+            signal.update(sentiment_snapshot)
+
+        return signal
 
     return None
 
@@ -241,15 +268,19 @@ def log_signal(signal: dict) -> None:
 # ─────────────────────────────────────────────────
 
 async def run_ws(coin_mgr: CoinManager, store: SignalStore,
-                 model, feature_cols, threshold: float, atr_config: dict):
+                 model, feature_cols, threshold: float, atr_config: dict,
+                 scorer: SentimentScorer | None = None):
     """WebSocket event loop with dynamic coin refresh."""
     import websockets
 
     exit_interval = 60
     coin_refresh_interval = 3600
-    last_exit_check = time.time()
-    last_coin_refresh = time.time()
-    last_status_print = time.time()
+    sentiment_interval = 300   # print sentiment summary every 5 min
+    last_exit_check     = time.time()
+    last_coin_refresh   = time.time()
+    last_status_print   = time.time()
+    last_sentiment_print = time.time()
+    _breadth_pct: float | None = None   # shared across candles, updated with ticker refresh
 
     while True:
         # Build stream URL from current coin list
@@ -282,6 +313,11 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                             if added or removed:
                                 reconnect = True
                             last_coin_refresh = now
+
+                        if scorer and now - last_sentiment_print >= sentiment_interval:
+                            _, snap = scorer.evaluate(breadth_pct=_breadth_pct)
+                            scorer.print_status(snap)
+                            last_sentiment_print = now
 
                         if now - last_status_print >= 900:
                             print(f"  [{datetime.now(timezone.utc).strftime('%H:%M')}] "
@@ -319,7 +355,9 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                     state.append_candle(parse_ws_candle(kline))
 
                     signal = predict_signal(
-                        state, coin_mgr.htf_cache, store, model, feature_cols, threshold, atr_config
+                        state, coin_mgr.htf_cache, store, model, feature_cols,
+                        threshold, atr_config,
+                        scorer=scorer, breadth_pct=_breadth_pct,
                     )
                     if signal:
                         is_new = store.save_signal(signal)
@@ -340,11 +378,34 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                             reconnect = True
                         last_coin_refresh = now
 
+                    if scorer and now - last_sentiment_print >= sentiment_interval:
+                        _, snap = scorer.evaluate(breadth_pct=_breadth_pct)
+                        scorer.print_status(snap)
+                        last_sentiment_print = now
+
         except (Exception,) as e:
             if not reconnect:
-                import traceback
-                print(f"  WebSocket error: {e}. Reconnecting in 5s...")
-                traceback.print_exc()   # full stack trace so we know exact line
+                import traceback, socket
+                try:
+                    import websockets.exceptions as _wse
+                    _transient = (_wse.ConnectionClosedError, _wse.ConnectionClosedOK)
+                except Exception:
+                    _transient = ()
+
+                is_transient = (
+                    isinstance(e, _transient)           # Binance dropped connection
+                    or isinstance(e, socket.gaierror)   # DNS blip
+                    or isinstance(e, (TimeoutError, ConnectionResetError, OSError))
+                )
+
+                if is_transient:
+                    # Known network hiccup — one-liner, no traceback noise
+                    print(f"  WebSocket: {type(e).__name__} — reconnecting in 5s...")
+                else:
+                    # Unexpected error — full trace so we can debug
+                    print(f"  WebSocket error: {e}. Reconnecting in 5s...")
+                    traceback.print_exc()
+
                 await asyncio.sleep(5)
             else:
                 print(f"  Reconnecting for coin list update...")
@@ -356,7 +417,8 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 # ─────────────────────────────────────────────────
 
 def run_poll(coin_mgr: CoinManager, store: SignalStore,
-             model, feature_cols, threshold: float, atr_config: dict, interval: int = 60):
+             model, feature_cols, threshold: float, atr_config: dict,
+             interval: int = 60, scorer: SentimentScorer | None = None):
     """REST polling loop."""
     last_candle_times: dict[str, pd.Timestamp] = {}
 
@@ -402,7 +464,10 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
                             state.df = state.df.iloc[-300:].reset_index(drop=True)
                         state.df = build_features(state.df)
 
-                    signal = predict_signal(state, coin_mgr.htf_cache, store, model, feature_cols, threshold, atr_config)
+                    signal = predict_signal(
+                        state, coin_mgr.htf_cache, store, model, feature_cols,
+                        threshold, atr_config, scorer=scorer,
+                    )
                     if signal:
                         is_new = store.save_signal(signal)
                         if is_new:
@@ -461,24 +526,37 @@ def main():
     else:
         symbols = None  # CoinManager will fetch from API
 
+    # Initialise sentiment scorer
+    scorer = SentimentScorer()
+
+    # Warm up sentiment on startup (prints initial reading)
+    try:
+        _, snap = scorer.evaluate()
+        scorer.print_status(snap)
+    except Exception:
+        pass
+
     print(f"{'='*60}")
     print(f"  CRYPTO SIGNAL SCANNER")
     print(f"  Mode: {args.mode.upper()} | Threshold: {threshold} | Top: {args.top}")
-    print(f"  ATR TP={atr_config['tp_atr_mult']}× SL={atr_config['sl_atr_mult']}× "
+    print(f"  ATR TP={atr_config['tp_atr_mult']}\u00d7 SL={atr_config['sl_atr_mult']}\u00d7 "
           f"| Fallback SL={EXIT_CONFIG['initial_sl_pct']:.1%} TP={EXIT_CONFIG['tp_pct']:.1%}")
+    print(f"  Sentiment: adaptive threshold enabled")
     print(f"  CSV: {store.current_csv}")
     print(f"{'='*60}")
 
     coin_mgr.warmup(symbols)
-    store.cleanup_old_csvs(keep_months=3)
 
     if args.mode == 'ws':
-        try:
-            asyncio.run(run_ws(coin_mgr, store, model, feature_cols, threshold, atr_config))
-        except KeyboardInterrupt:
-            print("\nScanner stopped.")
+        asyncio.run(run_ws(
+            coin_mgr, store, model, feature_cols, threshold, atr_config,
+            scorer=scorer,
+        ))
     else:
-        run_poll(coin_mgr, store, model, feature_cols, threshold, atr_config, args.poll_interval)
+        run_poll(
+            coin_mgr, store, model, feature_cols, threshold, atr_config,
+            interval=args.poll_interval, scorer=scorer,
+        )
 
 
 if __name__ == '__main__':
