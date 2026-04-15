@@ -109,6 +109,60 @@ class CoinState:
         return self.df.memory_usage(deep=True).sum() / 1024
 
 
+class LiveEMAState:
+    """
+    Rolling 1-minute candle EMA tracker for live entry-timing checks.
+
+    Fed by the WebSocket 1m kline stream (zero REST I/O after warmup).
+    Used in predict_signal to detect whether price has already run too far
+    above EMA21 before committing to an entry — the root cause of late entries
+    on high-positive-sentiment signals.
+    """
+
+    __slots__ = ['symbol', 'closes', 'ema9', 'ema21', 'max_candles']
+
+    def __init__(self, symbol: str, max_candles: int = 100):
+        self.symbol     = symbol
+        self.closes: list[float] = []
+        self.ema9:   float | None = None
+        self.ema21:  float | None = None
+        self.max_candles = max_candles
+
+    def update(self, close: float) -> None:
+        """Ingest one 1m close and update EMA9 / EMA21 incrementally."""
+        self.closes.append(close)
+        if len(self.closes) > self.max_candles:
+            self.closes.pop(0)
+
+        k9  = 2 / (9  + 1)
+        k21 = 2 / (21 + 1)
+
+        if self.ema9 is None:
+            if len(self.closes) >= 9:
+                self.ema9 = sum(self.closes[-9:]) / 9
+        else:
+            self.ema9 = close * k9 + self.ema9 * (1 - k9)
+
+        if self.ema21 is None:
+            if len(self.closes) >= 21:
+                self.ema21 = sum(self.closes[-21:]) / 21
+        else:
+            self.ema21 = close * k21 + self.ema21 * (1 - k21)
+
+    def entry_is_fresh(self, current_price: float, max_extension: float = 0.004) -> bool:
+        """
+        True if price is still close enough to EMA21 for a clean entry.
+
+        Returns False (block) when price is more than `max_extension` above
+        EMA21 — meaning momentum already played out and we'd be entering late.
+        Returns True (allow) when EMA21 is not yet warmed up (< 21 candles).
+        """
+        if self.ema21 is None:
+            return True   # not enough 1m data yet — don't block
+        extension = (current_price - self.ema21) / self.ema21
+        return extension <= max_extension
+
+
 class HTFCache:
     """Higher timeframe feature cache with lazy refresh.
 
@@ -189,6 +243,7 @@ class CoinManager:
         self.top_n = top_n
         self.refresh_interval = refresh_interval
         self.coin_states: dict[str, CoinState] = {}  # key: symbol lowercase
+        self.live_ema_states: dict[str, LiveEMAState] = {}  # key: symbol lowercase
         self.htf_cache = HTFCache(full_refresh_interval=900)
         self._last_coin_refresh = 0.0
         self._active_symbols: set[str] = set()
@@ -227,16 +282,32 @@ class CoinManager:
             for interval in ['4h', '1d']:
                 self.htf_cache.refresh_one(symbol, interval)
 
+            # Pre-warm 1m EMA state
+            self._init_live_ema(symbol)
+
             return True
         except Exception as e:
             print(f"    [!] {symbol}: {e}")
             return False
+
+    def _init_live_ema(self, symbol: str) -> None:
+        """Pre-warm LiveEMAState with the last 50 1m candles via REST."""
+        key = symbol.lower()
+        state = LiveEMAState(symbol)
+        try:
+            df_1m = fetch_klines(symbol, '1m', 50)
+            for close in df_1m['close']:
+                state.update(float(close))
+        except Exception as e:
+            print(f"    [!] LiveEMA warmup failed for {symbol}: {e}")
+        self.live_ema_states[key] = state
 
     def _remove_coin(self, symbol: str) -> None:
         """Remove coin and free its memory."""
         key = symbol.lower()
         if key in self.coin_states:
             del self.coin_states[key]
+        self.live_ema_states.pop(key, None)
         self.htf_cache.drop(symbol)
         self._active_symbols.discard(key)
 

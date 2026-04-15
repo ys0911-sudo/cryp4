@@ -58,6 +58,21 @@ EXIT_CONFIG = {
     'max_hold_minutes':     2880,    # 48 hours max hold on 1H entries
 }
 
+# ─── Entry timing config ───────────────────────────────────────────────────
+# Three filters applied before committing to an active (non-blocked) signal:
+#   1. max_sl_pct       — cap SL at this % when ATR-derived SL is too wide
+#                         (prevents FFUSDT-style -9.25% catastrophic losses;
+#                          TP stays ATR-level so R:R actually improves)
+#   2. live_ema_max_ext — skip when price is already >N% above the 1m EMA21
+#                         (prevents entering after momentum has already run)
+#   3. sl_cooldown_hours — block re-entry on a coin that just hit stop loss
+#                         (prevents BANKUSDT / STOUSDT back-to-back losses)
+ENTRY_CONFIG = {
+    'max_sl_pct':        0.05,   # cap SL at 5% when ATR-derived SL is wider
+    'live_ema_max_ext':  0.004,  # skip if price >0.4% above 1m EMA21
+    'sl_cooldown_hours': 6,      # hours to block re-entry after a stop loss
+}
+
 
 def load_model():
     """Load model bundle and verify SHA-256 integrity hash."""
@@ -100,6 +115,7 @@ def predict_signal(
     atr_config: dict,
     scorer: SentimentScorer | None = None,
     breadth_pct: float | None = None,
+    live_ema_states: dict | None = None,
 ) -> dict | None:
     """Check latest candle for a high-confidence signal.
 
@@ -122,6 +138,11 @@ def predict_signal(
 
     # No re-entry: skip if this coin already has an open trade
     if store._open_positions.get(sym):
+        return None
+
+    # Entry timing gate: per-coin cooldown after a stop loss
+    # Checked early to avoid expensive HTF merge + model inference on blocked coins
+    if store.is_in_cooldown(sym, hours=ENTRY_CONFIG['sl_cooldown_hours']):
         return None
 
     # Dedup: no repeat signals within one 1H candle (3600s)
@@ -205,6 +226,29 @@ def predict_signal(
         sl = entry_price * (1 - EXIT_CONFIG['initial_sl_pct'])
         trail_activate = entry_price * (1 + EXIT_CONFIG['trailing_activate_pct'])
         trail_distance = entry_price * EXIT_CONFIG['trailing_distance_pct']
+
+    # ── Entry timing gates (active signals only — blocked signals pass through
+    #    so they are still logged to CSV for model training) ────────────────
+    if not sentiment_blocked:
+        # Gate 1: cap SL distance — if ATR implies a stop wider than max_sl_pct,
+        # clamp it to max_sl_pct instead of discarding the signal entirely.
+        # trail_activate and trail_distance are re-derived from the capped distance
+        # so the whole trade stays internally consistent.
+        # TP is kept at the original ATR level — tighter SL + same TP = better R:R.
+        sl_pct = (entry_price - sl) / entry_price
+        if sl_pct > ENTRY_CONFIG['max_sl_pct']:
+            sl             = entry_price * (1 - ENTRY_CONFIG['max_sl_pct'])
+            capped_dist    = entry_price - sl          # absolute $ distance of cap
+            trail_activate = entry_price + capped_dist  # activates 1× cap-dist above entry
+            trail_distance = capped_dist * 0.5          # trails 0.5× cap-dist below peak
+
+        # Gate 2: 1m live EMA freshness — block if price already extended
+        if live_ema_states is not None:
+            live_state = live_ema_states.get(sym.lower())
+            if live_state and not live_state.entry_is_fresh(
+                entry_price, max_extension=ENTRY_CONFIG['live_ema_max_ext']
+            ):
+                return None  # price too far above 1m EMA21 — late entry detected
 
     limit_entry = round((entry_price + float(latest['low'])) / 2, 8)
     coin_state.last_signal_time = latest['open_time']
@@ -317,17 +361,20 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
     _breadth_pct: float | None = None       # shared across candles, updated with ticker refresh
 
     while True:
-        # Build stream URL from current coin list
+        # Build stream URL — 1H for signals + 1m for live EMA freshness checks.
+        # 50 coins × 2 intervals = 100 streams, well within Binance's 200 limit.
         symbols = coin_mgr.get_active_symbols()
-        streams = [f"{s.lower()}@kline_1h" for s in symbols]
-        stream_path = "/".join(streams[:200])  # Binance limit: 200 per connection
+        streams_1h = [f"{s.lower()}@kline_1h" for s in symbols]
+        streams_1m = [f"{s.lower()}@kline_1m" for s in symbols]
+        all_streams = streams_1h + streams_1m
+        stream_path = "/".join(all_streams[:200])
         url = f"{BINANCE_WS}/stream?streams={stream_path}"
 
         reconnect = False
 
         try:
             async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
-                print(f"  WebSocket connected ({len(symbols)} coins)")
+                print(f"  WebSocket connected ({len(symbols)} coins, 1H + 1m streams)")
 
                 while not reconnect:
                     try:
@@ -369,10 +416,29 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                     if data.get('e') != 'kline':
                         continue
 
-                    kline = data['k']
+                    kline     = data['k']
                     sym_upper = kline['s']
+                    sym_lower = sym_upper.lower()
 
-                    # ─── Live exit check on EVERY tick (open or closed candle) ───
+                    # ─── 1m tick: update live EMA + live exit check ───────────
+                    # 1m messages come far more frequently than 1H closes.
+                    # We feed them to LiveEMAState for the entry-freshness check
+                    # and also use them for tighter SL/TP detection.
+                    if kline['i'] == '1m':
+                        live_state = coin_mgr.live_ema_states.get(sym_lower)
+                        if live_state:
+                            live_state.update(float(kline['c']))
+                        live_price = float(kline['c'])
+                        live_exits = store.check_exits_live(sym_upper, live_price)
+                        for t in live_exits:
+                            print(f"  LIVE EXIT {t['symbol']}: {t['reason']} | "
+                                  f"Entry={t['entry']:.6f} | Exit={t['exit']:.6f} | "
+                                  f"PnL={t['pnl']:+.2f}%")
+                            if notifier:
+                                notifier.send_exit(t)
+                        continue  # 1m ticks never trigger signal processing
+
+                    # ─── 1H tick: live exit check ────────────────────────────
                     # Fires SL/TP at the exact trigger price, not 60s later.
                     live_price = float(kline['c'])
                     live_exits = store.check_exits_live(sym_upper, live_price)
@@ -383,11 +449,10 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         if notifier:
                             notifier.send_exit(t)
 
-                    if not kline['x']:  # candle not closed — skip signal processing
+                    if not kline['x']:  # 1H candle not closed — skip signal processing
                         continue
 
-                    # ─── Candle closed — process signal ───
-                    sym_lower = sym_upper.lower()
+                    # ─── 1H candle closed — process signal ───
                     state = coin_mgr.coin_states.get(sym_lower)
                     if state is None:
                         continue
@@ -398,6 +463,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                         state, coin_mgr.htf_cache, store, model, feature_cols,
                         threshold, atr_config,
                         scorer=scorer, breadth_pct=_breadth_pct,
+                        live_ema_states=coin_mgr.live_ema_states,
                     )
                     if signal:
                         is_new = store.save_signal(signal)
@@ -516,6 +582,7 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
                     signal = predict_signal(
                         state, coin_mgr.htf_cache, store, model, feature_cols,
                         threshold, atr_config, scorer=scorer,
+                        live_ema_states=coin_mgr.live_ema_states,
                     )
                     if signal:
                         is_new = store.save_signal(signal)

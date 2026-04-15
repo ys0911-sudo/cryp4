@@ -64,7 +64,12 @@ class SignalStore:
         # key: "SYMBOL|signal_time"
         self._recently_closed: set[str] = set()
 
+        # Per-coin stop-loss timestamps for re-entry cooldown.
+        # key: symbol (UPPERCASE), value: UTC datetime of last stop_loss exit
+        self._last_stop_loss: dict[str, datetime] = {}
+
         self._load_open_positions()
+        self._load_stop_loss_times()
 
     # ─────────────────────────────────────────────────
     # Startup
@@ -90,6 +95,49 @@ class SignalStore:
                 print(f"  [store] Resumed {total} open position(s) from CSV")
         except Exception as e:
             print(f"  [store] Warning: could not load open positions: {e}")
+
+    def _load_stop_loss_times(self) -> None:
+        """
+        Restore recent stop-loss exit times from CSV on startup so the
+        per-coin cooldown survives scanner restarts.
+
+        Only considers stop_loss exits within the last 24 hours — older
+        ones are irrelevant for a 6-hour cooldown window.
+        """
+        csv_path = self.current_csv
+        if not csv_path.exists():
+            return
+        try:
+            df = pd.read_csv(csv_path)
+            if 'exit_reason' not in df.columns or 'exit_time' not in df.columns:
+                return
+            sl_df = df[
+                (df['exit_reason'] == 'stop_loss') &
+                df['exit_time'].notna() &
+                (df['exit_time'].astype(str).str.strip() != '')
+            ]
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            for _, row in sl_df.iterrows():
+                sym = str(row['symbol'])
+                try:
+                    raw = str(row['exit_time']).replace(' IST', '').replace(' UTC', '')
+                    exit_dt = pd.to_datetime(raw, errors='coerce')
+                    if pd.isna(exit_dt):
+                        continue
+                    if exit_dt.tzinfo is None:
+                        exit_dt = exit_dt.replace(tzinfo=IST)
+                    exit_dt_utc = exit_dt.astimezone(timezone.utc)
+                    if exit_dt_utc > cutoff:
+                        prev = self._last_stop_loss.get(sym)
+                        if prev is None or exit_dt_utc > prev:
+                            self._last_stop_loss[sym] = exit_dt_utc
+                except Exception:
+                    continue
+            if self._last_stop_loss:
+                names = ', '.join(self._last_stop_loss.keys())
+                print(f"  [store] Cooldown active for: {names}")
+        except Exception as e:
+            print(f"  [store] Warning: could not load stop-loss times: {e}")
 
     # ─────────────────────────────────────────────────
     # Properties
@@ -188,6 +236,10 @@ class SignalStore:
                     'pnl_pct':     pnl,
                     'peak_price':  round(peak, 8),
                 })
+
+                # Record stop-loss time for per-coin re-entry cooldown
+                if exit_reason == 'stop_loss':
+                    self._last_stop_loss[symbol] = now
 
                 # Register as closed BEFORE writing CSV so the REST fallback
                 # check_exits() won't re-add this position if the CSV write fails.
@@ -410,6 +462,20 @@ class SignalStore:
     # ─────────────────────────────────────────────────
     # Stats & housekeeping
     # ─────────────────────────────────────────────────
+
+    def is_in_cooldown(self, symbol: str, hours: int = 6) -> bool:
+        """
+        True if `symbol` hit a stop_loss within the last `hours` hours.
+
+        Prevents re-entering a coin that just stopped out — a pattern that
+        consistently produced back-to-back losses in the trade log (e.g.
+        BANKUSDT, STOUSDT, TAOUSDT entering again within minutes of a stop).
+        """
+        last_sl = self._last_stop_loss.get(symbol)
+        if last_sl is None:
+            return False
+        elapsed_hours = (datetime.now(timezone.utc) - last_sl).total_seconds() / 3600
+        return elapsed_hours < hours
 
     def get_open_count(self) -> int:
         return sum(len(v) for v in self._open_positions.values())
