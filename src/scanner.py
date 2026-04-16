@@ -352,7 +352,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 
     exit_interval = 60
     coin_refresh_interval = 3600
-    sentiment_interval = 300   # print sentiment summary every 5 min
+    sentiment_interval = 600   # print sentiment summary every 10 min
     last_exit_check        = time.time()
     last_coin_refresh      = time.time()
     last_status_print      = time.time()
@@ -386,7 +386,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                             closed = store.check_exits()
                             for t in closed:
                                 print(f"  EXIT {t['symbol']}: {t['reason']} | "
-                                      f"PnL={t['pnl']:+.2f}%")
+                                      f"PnL={t['pnl']:+.2f}%", flush=True)
                             last_exit_check = now
 
                         if now - last_coin_refresh >= coin_refresh_interval:
@@ -406,7 +406,7 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
 
                         if now - last_status_print >= 900:
                             print(f"  [{datetime.now(IST).strftime('%H:%M IST')}] "
-                                  f"{store.get_stats_summary()}")
+                                  f"{store.get_stats_summary()}", flush=True)
                             last_status_print = now
                         continue
 
@@ -436,6 +436,41 @@ async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                                   f"PnL={t['pnl']:+.2f}%")
                             if notifier:
                                 notifier.send_exit(t)
+
+                        # ── Periodic maintenance on 1m heartbeat ──────────────
+                        # 1m messages arrive every few seconds so the 30s timeout
+                        # never fires. Run time-based checks here so sentiment
+                        # prints and status updates are not delayed until a 1H
+                        # candle closes (up to 60 minutes away).
+                        now = time.time()
+                        if now - last_exit_check >= exit_interval:
+                            _closed = store.check_exits()
+                            for t in _closed:
+                                print(f"  EXIT {t['symbol']}: {t['reason']} | "
+                                      f"PnL={t['pnl']:+.2f}%", flush=True)
+                                if notifier:
+                                    notifier.send_exit(t)
+                            last_exit_check = now
+
+                        if scorer and now - last_sentiment_print >= sentiment_interval:
+                            _, snap = scorer.evaluate(breadth_pct=_breadth_pct)
+                            scorer.print_status(snap)
+                            last_sentiment_print = now
+                            if notifier and now - last_sentiment_telegram >= 1800:
+                                notifier.send_sentiment(snap)
+                                last_sentiment_telegram = now
+
+                        if now - last_status_print >= 900:
+                            print(f"  [{datetime.now(IST).strftime('%H:%M IST')}] "
+                                  f"{store.get_stats_summary()}", flush=True)
+                            last_status_print = now
+
+                        if now - last_coin_refresh >= coin_refresh_interval:
+                            added, removed = coin_mgr.refresh_coin_list()
+                            if added or removed:
+                                reconnect = True
+                            last_coin_refresh = now
+
                         continue  # 1m ticks never trigger signal processing
 
                     # ─── 1H tick: live exit check ────────────────────────────
@@ -625,6 +660,10 @@ def run_poll(coin_mgr: CoinManager, store: SignalStore,
 # ─────────────────────────────────────────────────
 
 def main():
+    # Force line-buffered stdout so every print() flushes immediately.
+    # Critical for AWS/tmux deployments where Python defaults to block buffering.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description='Crypto Signal Scanner')
     parser.add_argument('-t', '--threshold', type=float, default=0.65)
     parser.add_argument('--top', type=int, default=50)

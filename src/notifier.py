@@ -46,9 +46,9 @@ import requests
 IST = timezone(timedelta(hours=5, minutes=30))
 
 TELEGRAM_API = "https://api.telegram.org"
-_SEND_TIMEOUT = 8    # seconds per API call
-_RETRY_DELAY  = 3    # seconds between retries
-_MAX_RETRIES  = 2
+_SEND_TIMEOUT = 10   # seconds per API call
+_RETRY_DELAY  = 5    # seconds between retries
+_MAX_RETRIES  = 3
 
 
 class TelegramNotifier:
@@ -77,6 +77,11 @@ class TelegramNotifier:
         self.send_blocked_alerts = send_blocked if send_blocked is not None else env_blocked
 
         self.enabled = bool(self.token and self.chat_id)
+
+        # Persistent HTTP session — reuses TCP connection, avoids Windows
+        # ConnectionResetError(10054) from cold-opening a new socket every send.
+        self._session = requests.Session()
+        self._session.headers.update({'Connection': 'keep-alive'})
 
         # Background sender thread + queue
         self._queue: queue.Queue = queue.Queue(maxsize=200)
@@ -300,7 +305,7 @@ class TelegramNotifier:
         }
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                r = requests.post(url, json=payload, timeout=_SEND_TIMEOUT)
+                r = self._session.post(url, json=payload, timeout=_SEND_TIMEOUT)
                 if r.status_code == 200:
                     return
                 # 429 = rate limit — back off

@@ -430,5 +430,6 @@ class SentimentScorer:
         print(
             f"  [Sentiment] score={score:+} thr={thr} | "
             f"BTC4hRSI={rsi_s} basis={basis_s} L/S={ls_s} "
-            f"OI\u0394={oi_s} breadth={brd_s}"
+            f"OI\u0394={oi_s} breadth={brd_s}",
+            flush=True,
         )
