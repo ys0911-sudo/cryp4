@@ -62,7 +62,10 @@ from __future__ import annotations
 import time
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.live_feeds import CVDTracker, LiquidationTracker
 
 import numpy as np
 import pandas as pd
@@ -249,9 +252,15 @@ class SentimentScorer:
         signal.update(snapshot)
     """
 
-    def __init__(self):
-        self._cache: dict = {}
-        self._lock  = threading.Lock()
+    def __init__(
+        self,
+        cvd_tracker:  Optional[CVDTracker]          = None,
+        liq_tracker:  Optional[LiquidationTracker]  = None,
+    ) -> None:
+        self._cache       : dict = {}
+        self._lock        = threading.Lock()
+        self._cvd_tracker = cvd_tracker
+        self._liq_tracker = liq_tracker
 
     # ── Cache helpers ──────────────────────────────────────────
 
@@ -284,13 +293,24 @@ class SentimentScorer:
             # Fallback: fetch breadth ourselves (slower path)
             breadth_pct = self._cached('breadth', _FAST_TTL, self._fetch_breadth_fallback)
 
-        return {
+        snap = {
             'sent_btc_4h_rsi': btc_4h_rsi,
             'sent_basis':      basis,
             'sent_ls_ratio':   ls_ratio,
             'sent_oi_delta':   oi_delta,
             'sent_breadth':    breadth_pct,
         }
+
+        # ── Live microstructure feeds (CVD + Liquidations) ────────────
+        # These are optional — populated once the async trackers are running.
+        # During warmup (<5 min) all values are 0.0 and do not affect scoring.
+        if self._cvd_tracker is not None:
+            snap.update(self._cvd_tracker.snapshot())
+
+        if self._liq_tracker is not None:
+            snap.update(self._liq_tracker.snapshot())
+
+        return snap
 
     def evaluate(
         self,
@@ -378,6 +398,44 @@ class SentimentScorer:
             elif breadth > 60:
                 score += 1   # broad rally — supportive
 
+        # ── CVD (Cumulative Volume Delta) ─────────────────────
+        # Scored only after 5-minute warmup. During warmup all values are 0.0
+        # and the is_ready guard keeps them neutral (no scoring impact).
+        cvd_ready = self._cvd_tracker is not None and self._cvd_tracker.is_ready
+        ratio_15m = snap.get('cvd_ratio_15m', 0.0)
+        ratio_1h  = snap.get('cvd_ratio_1h',  0.0)
+        basis_val = snap.get('sent_basis') or 0.0
+
+        if cvd_ready:
+            # 15m ratio: short-term order flow at the moment of signal
+            if ratio_15m > 0.20:
+                score += 2   # strong taker buying — confirms long entry
+            elif ratio_15m > 0.08:
+                score += 1   # mild buying edge
+            elif ratio_15m < -0.20:
+                score -= 2   # strong taker selling — contradicts long
+            elif ratio_15m < -0.08:
+                score -= 1   # mild selling pressure
+
+            # Divergence: 1H CVD negative while basis is positive
+            # = price drifting up but sellers winning order flow → distribution
+            if ratio_1h < -0.10 and basis_val > 0:
+                score -= 2
+
+        # ── Liquidations ──────────────────────────────────────
+        # A spike in forced liquidations = capitulation → contrarian bullish.
+        # No penalty for low liquidation — that is simply normal conditions.
+        liq_ready = self._liq_tracker is not None and self._liq_tracker.is_ready
+        liq_5m    = snap.get('liq_5m_usd', 0.0)
+
+        if liq_ready and liq_5m > 0:
+            if liq_5m >= 100_000_000:   # ≥ $100M / 5 min — extreme capitulation
+                score += 3
+            elif liq_5m >= 50_000_000:  # ≥ $50M — significant forced selling
+                score += 2
+            elif liq_5m >= 20_000_000:  # ≥ $20M — notable pressure
+                score += 1
+
         return score
 
     @staticmethod
@@ -421,15 +479,27 @@ class SentimentScorer:
         score = snap.get('sent_score', '?')
         thr   = snap.get('sent_threshold', '?')
 
-        rsi_s   = f"{rsi:.0f}"          if rsi   is not None else "N/A"
+        rsi_s   = f"{rsi:.0f}"           if rsi   is not None else "N/A"
         basis_s = f"{basis * 100:+.3f}%" if basis is not None else "N/A"
-        ls_s    = f"{ls:.2f}"            if ls    is not None else "N/A"
-        oi_s    = f"{oi:+.1f}%"          if oi    is not None else "N/A"
-        brd_s   = f"{brd:.0f}%"          if brd   is not None else "N/A"
+        ls_s    = f"{ls:.2f}"             if ls    is not None else "N/A"
+        oi_s    = f"{oi:+.1f}%"           if oi    is not None else "N/A"
+        brd_s   = f"{brd:.0f}%"           if brd   is not None else "N/A"
+
+        # CVD — only show once tracker has warmed up
+        cvd_ready  = self._cvd_tracker is not None and self._cvd_tracker.is_ready
+        ratio_15m  = snap.get('cvd_ratio_15m')
+        cvd_s      = f"{ratio_15m:+.2f}" if (cvd_ready and ratio_15m is not None) else "…"
+
+        # Liquidations — show once tracker is alive
+        liq_ready  = self._liq_tracker is not None and self._liq_tracker.is_ready
+        liq_5m     = snap.get('liq_5m_usd')
+        liq_s      = (f"${liq_5m/1_000_000:.1f}M" if (liq_ready and liq_5m is not None)
+                      else "…")
 
         print(
             f"  [Sentiment] score={score:+} thr={thr} | "
             f"BTC4hRSI={rsi_s} basis={basis_s} L/S={ls_s} "
-            f"OI\u0394={oi_s} breadth={brd_s}",
+            f"OI\u0394={oi_s} breadth={brd_s} | "
+            f"CVD15m={cvd_s} Liq5m={liq_s}",
             flush=True,
         )

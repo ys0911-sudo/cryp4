@@ -33,6 +33,7 @@ from src.coin_manager import CoinManager, CoinState, fetch_klines, LARGE_CAP_EXC
 from src.signal_store import SignalStore
 from src.sentiment import SentimentScorer
 from src.notifier import TelegramNotifier
+from src.live_feeds import CVDTracker, LiquidationTracker
 
 # Force unbuffered output
 if hasattr(sys.stdout, 'reconfigure'):
@@ -346,9 +347,22 @@ def log_blocked_signal(signal: dict, notifier: TelegramNotifier | None = None) -
 async def run_ws(coin_mgr: CoinManager, store: SignalStore,
                  model, feature_cols, threshold: float, atr_config: dict,
                  scorer: SentimentScorer | None = None,
-                 notifier: TelegramNotifier | None = None):
+                 notifier: TelegramNotifier | None = None,
+                 cvd_tracker: CVDTracker | None = None,
+                 liq_tracker: LiquidationTracker | None = None):
     """WebSocket event loop with dynamic coin refresh."""
     import websockets
+
+    # Start live microstructure feeds as concurrent background tasks.
+    # asyncio.create_task() schedules them on the running event loop so they
+    # stream independently without blocking the main price WebSocket.
+    # References are kept to prevent garbage collection.
+    _cvd_task = asyncio.create_task(cvd_tracker.run()) if cvd_tracker else None
+    _liq_task = asyncio.create_task(liq_tracker.run()) if liq_tracker else None
+    if _cvd_task:
+        print("  [Live] CVD tracker started (btcusdt@aggTrade)", flush=True)
+    if _liq_task:
+        print("  [Live] Liquidation tracker started (!forceOrder@arr)", flush=True)
 
     exit_interval = 60
     coin_refresh_interval = 3600
@@ -686,8 +700,15 @@ def main():
     else:
         symbols = None  # CoinManager will fetch from API
 
-    # Initialise sentiment scorer
-    scorer = SentimentScorer()
+    # Initialise live microstructure trackers
+    # These start as idle objects — the async tasks that feed them are
+    # launched inside run_ws() once the event loop is running.
+    cvd_tracker = CVDTracker()
+    liq_tracker = LiquidationTracker()
+
+    # Initialise sentiment scorer — trackers passed in so their snapshots
+    # are included in every evaluate() call and logged with every signal.
+    scorer = SentimentScorer(cvd_tracker=cvd_tracker, liq_tracker=liq_tracker)
 
     # Initialise Telegram notifier (reads TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID from env)
     notifier = TelegramNotifier()
@@ -717,6 +738,7 @@ def main():
         asyncio.run(run_ws(
             coin_mgr, store, model, feature_cols, threshold, atr_config,
             scorer=scorer, notifier=notifier,
+            cvd_tracker=cvd_tracker, liq_tracker=liq_tracker,
         ))
     else:
         run_poll(
